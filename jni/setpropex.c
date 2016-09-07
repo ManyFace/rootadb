@@ -15,14 +15,21 @@
 
 extern struct prop_area *__system_property_area__;
 
+static char* left_trim(char * str)
+{
+    int i=0;
+    while(str[i++]==' ');
+    return str + i - 1;
+}
+
 #define  LOG_TAG    "setpropex"
-#define  LOGI(...)  __android_log_print(ANDROID_LOG_INFO,LOG_TAG,__VA_ARGS__)
+#define  LOGI(format,args...) __android_log_print(ANDROID_LOG_INFO,LOG_TAG,format,##args)
 #ifndef NDEBUG
-#define  LOGD(...)  __android_log_print(ANDROID_LOG_DEBUG,LOG_TAG,__VA_ARGS__)
+#define  LOGD(format,args...) __android_log_print(ANDROID_LOG_DEBUG,LOG_TAG,format,##args)
 #else
-#define  LOGD(...)
+#define  LOGD(format,args...)  __android_log_print(ANDROID_LOG_DEBUG,LOG_TAG,format,##args)
 #endif
-#define  LOGE(...)  __android_log_print(ANDROID_LOG_ERROR,LOG_TAG,__VA_ARGS__)
+#define  LOGE(format,args...) __android_log_print(ANDROID_LOG_ERROR,LOG_TAG,format,##args)
 
 #include <android/log.h>
 
@@ -31,8 +38,13 @@ typedef struct mapinfo mapinfo;
 struct mapinfo {
     mapinfo *next;
     int pid;
-    unsigned start;
+#ifdef __aarch64__
+    long long start;
+    long long end;
+#else
+	unsigned start;
     unsigned end;
+#endif
     char perm[8];
     char name[1024];
 };
@@ -60,17 +72,28 @@ skip:
         LOGE("read_mapinfo: NULL mapinfo!");
         return -1;
     }
-
+#ifdef __aarch64__
+	  mi->start = strtoll(line, 0, 16);
+	  mi->end = strtoll(strstr(line, "-") + 1, 0, 16);
+    strncpy(mi->perm, strstr(line, " ") + 1, 4);
+#else
     mi->start = strtoul(line, 0, 16);
     mi->end = strtoul(line + 9, 0, 16);
     strncpy(mi->perm, line + 18, 4);
+#endif
 
     if(len < 50) {
         LOGD("read_mapinfo: line too short! (%d bytes) skipping", len);
         //mi->name[0] = '\0';
-	    goto skip;
+        goto skip;
     } else {
-        strcpy(mi->name, line + 49);
+        char * name = left_trim(strstr(line, "    "));
+        if(strlen(name) == 0){
+            strcpy(mi->name, "NULL");
+        }
+        else{
+            strncpy(mi->name, name, sizeof(mi->name));
+        }
     }
 
     return 0;
@@ -81,18 +104,18 @@ static mapinfo *search_maps(int pid, const char* perm, const char* name)
     char tmp[128];
     FILE *fp;
     mapinfo *mi;
-    
+
     sprintf(tmp, "/proc/%d/maps", pid);
     fp = fopen(tmp, "r");
     if(fp == 0) {
         LOGE("search_maps: unable to open maps file: %s", strerror(errno));
         return 0;
     }
-    
+
     mi = calloc(1, sizeof(mapinfo) + 16);
 
     while(!read_mapinfo(fp, mi)) {
-        //LOGD("%08x %s %s", mi->start, mi->perm, mi->name);
+        //LOGD("%p %s %s", (void*)mi->start, mi->perm, mi->name);
         if(!strcmp(mi->perm, perm) && !strcmp(mi->name, name)){
             fclose(fp);
             mi->pid = pid;
@@ -106,7 +129,11 @@ static mapinfo *search_maps(int pid, const char* perm, const char* name)
     return 0;
 }
 
+#ifdef __aarch64__
+static void dump_region(int fd, long long start, long long end, char* mem)
+#else
 static void dump_region(int fd, unsigned start, unsigned end, char* mem)
+#endif
 {
     lseek64(fd, start, SEEK_SET);
     while(start < end) {
@@ -130,11 +157,16 @@ static void dump_region(int fd, unsigned start, unsigned end, char* mem)
 static void update_init(mapinfo *mi, void *pa, void *pi, size_t len)
 {
     unsigned offset = (pi - pa);
+#ifdef __aarch64__
+    long long *addr = (long long *)(mi->start + offset);
+    long long *data = (long long*)pi;
+#else
     unsigned *addr = (unsigned*)(mi->start + offset);
     unsigned *data = (unsigned*)pi;
+#endif
     int ret;
 
-    LOGD("write %08x", mi->start + offset);
+    LOGD("write %p", (void*)(mi->start + offset));
     for (int i = 0;  i < len / 4; i++) {
         ret = ptrace(PTRACE_POKEDATA, mi->pid, (void*)(addr + i), (void*)data[i]);
         if (ret != 0) {
@@ -230,7 +262,7 @@ static int setpropex(int init_pid, int argc, char *argv[])
         LOGE("didn't find mapinfo!");
         return 1;
     }
-    LOGD("map found @ %08x %08x %s %s", mi->start, mi->end, mi->perm, mi->name);
+    LOGD("map found @ %p %p %s %s", (void*)mi->start, (void*)mi->end, mi->perm, mi->name);
 
     /* open it up, so we can read a copy */
     sprintf(tmp, "/proc/%d/mem", init_pid);
